@@ -1,5 +1,8 @@
 import os
+import sys
 import logging
+import atexit
+from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import Update, BotCommand
@@ -32,6 +35,7 @@ GOALS:
   /fund [goal_id amount] - Add money to a goal
   /deletegoal <goal_id> - Remove a goal
   /distribute - Set auto-distribution rules
+  /rules - View current distribution rules
 
 OTHER:
   /help - Show this message
@@ -69,8 +73,30 @@ async def post_init(application):
         BotCommand("goals", "View goals with progress"),
         BotCommand("fund", "Add money to a goal"),
         BotCommand("distribute", "Set auto-distribution rules"),
+        BotCommand("rules", "View current distribution rules"),
         BotCommand("deletegoal", "Remove a goal"),
     ])
+
+
+LOCK_FILE = Path(__file__).parent / "bot.pid"
+
+
+def acquire_lock():
+    if LOCK_FILE.exists():
+        old_pid = int(LOCK_FILE.read_text().strip())
+        try:
+            os.kill(old_pid, 0)  # check if process is alive
+            logger.error("Bot is already running (PID %d). Exiting.", old_pid)
+            sys.exit(1)
+        except OSError:
+            logger.warning("Stale PID file found (PID %d no longer running). Removing.", old_pid)
+    LOCK_FILE.write_text(str(os.getpid()))
+    atexit.register(release_lock)
+
+
+def release_lock():
+    if LOCK_FILE.exists() and LOCK_FILE.read_text().strip() == str(os.getpid()):
+        LOCK_FILE.unlink()
 
 
 def main():
@@ -78,6 +104,7 @@ def main():
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set. Copy .env.example to .env and add your token.")
 
+    acquire_lock()
     db.init_db()
 
     app = ApplicationBuilder().token(token).post_init(post_init).build()

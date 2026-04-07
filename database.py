@@ -41,7 +41,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             goal_id INTEGER NOT NULL,
-            percentage REAL NOT NULL,
+            percentage REAL NOT NULL DEFAULT 0,
+            fixed_amount REAL NOT NULL DEFAULT 0,
+            rule_type TEXT NOT NULL DEFAULT 'percentage' CHECK(rule_type IN ('percentage', 'fixed')),
             FOREIGN KEY (goal_id) REFERENCES goals(id) ON DELETE CASCADE
         );
 
@@ -172,15 +174,21 @@ def delete_goal(user_id: int, goal_id: int) -> bool:
 
 # --- Distribution rule helpers ---
 
-def set_distribution_rules(user_id: int, rules: list[tuple[int, float]]):
-    """rules is a list of (goal_id, percentage) tuples. Replaces all existing rules."""
+def set_distribution_rules(user_id: int, rules: list[tuple[int, str, float]]):
+    """rules is a list of (goal_id, rule_type, value) tuples. Replaces all existing rules."""
     conn = get_connection()
     conn.execute("DELETE FROM distribution_rules WHERE user_id = ?", (user_id,))
-    for goal_id, pct in rules:
-        conn.execute(
-            "INSERT INTO distribution_rules (user_id, goal_id, percentage) VALUES (?, ?, ?)",
-            (user_id, goal_id, pct),
-        )
+    for goal_id, rule_type, value in rules:
+        if rule_type == "fixed":
+            conn.execute(
+                "INSERT INTO distribution_rules (user_id, goal_id, fixed_amount, rule_type) VALUES (?, ?, ?, 'fixed')",
+                (user_id, goal_id, value),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO distribution_rules (user_id, goal_id, percentage, rule_type) VALUES (?, ?, ?, 'percentage')",
+                (user_id, goal_id, value),
+            )
     conn.commit()
     conn.close()
 
@@ -188,7 +196,7 @@ def set_distribution_rules(user_id: int, rules: list[tuple[int, float]]):
 def get_distribution_rules(user_id: int) -> list[dict]:
     conn = get_connection()
     rows = conn.execute(
-        """SELECT dr.goal_id, dr.percentage, g.name as goal_name
+        """SELECT dr.goal_id, dr.percentage, dr.fixed_amount, dr.rule_type, g.name as goal_name
            FROM distribution_rules dr
            JOIN goals g ON g.id = dr.goal_id
            WHERE dr.user_id = ?""",
@@ -198,20 +206,56 @@ def get_distribution_rules(user_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_monthly_contributions(user_id: int, year: int, month: int) -> list[dict]:
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT g.name as goal_name, SUM(gc.amount) as total
+           FROM goal_contributions gc
+           JOIN goals g ON g.id = gc.goal_id
+           WHERE gc.user_id = ? AND strftime('%Y', gc.created_at) = ? AND strftime('%m', gc.created_at) = ?
+           GROUP BY gc.goal_id
+           ORDER BY total DESC""",
+        (user_id, str(year), f"{month:02d}"),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def distribute_income(user_id: int, amount: float, transaction_id: int) -> list[dict]:
-    """Distribute income across goals based on saved rules. Returns what was allocated."""
+    """Distribute income across goals based on saved rules.
+    Fixed amounts are deducted first, then percentages apply to the remainder."""
     rules = get_distribution_rules(user_id)
     if not rules:
         return []
 
     allocations = []
+    remaining = amount
+
+    # Fixed amounts first
     for rule in rules:
-        alloc_amount = round(amount * rule["percentage"] / 100, 2)
+        if rule["rule_type"] != "fixed":
+            continue
+        alloc_amount = min(round(rule["fixed_amount"], 2), remaining)
         if alloc_amount > 0:
             contribute_to_goal(user_id, rule["goal_id"], alloc_amount, transaction_id)
             allocations.append({
                 "goal_name": rule["goal_name"],
                 "amount": alloc_amount,
-                "percentage": rule["percentage"],
+                "label": f"{rule['fixed_amount']:,.2f} fixed",
             })
+            remaining -= alloc_amount
+
+    # Percentages on the remainder
+    for rule in rules:
+        if rule["rule_type"] != "percentage":
+            continue
+        alloc_amount = round(remaining * rule["percentage"] / 100, 2)
+        if alloc_amount > 0:
+            contribute_to_goal(user_id, rule["goal_id"], alloc_amount, transaction_id)
+            allocations.append({
+                "goal_name": rule["goal_name"],
+                "amount": alloc_amount,
+                "label": f"{rule['percentage']}%",
+            })
+
     return allocations

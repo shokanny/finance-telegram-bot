@@ -217,70 +217,128 @@ async def distribute_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if current_rules:
         lines.append("\nCurrent rules:")
         for r in current_rules:
-            lines.append(f"  {r['goal_name']}: {r['percentage']}%")
+            if r["rule_type"] == "fixed":
+                lines.append(f"  {r['goal_name']}: {r['fixed_amount']:,.2f} fixed")
+            else:
+                lines.append(f"  {r['goal_name']}: {r['percentage']}%")
 
-    lines.append("\nEnter rules as: goal_id percentage")
-    lines.append("One per line, then send /done")
-    lines.append("Example:\n  1 50\n  2 20\n  3 10")
-    lines.append("\nTotal can be up to 100%. The rest stays as free spending.")
+    lines.append("\nSend all rules in one message, one per line:")
+    lines.append("  Use % for percentage: 1 50%")
+    lines.append("  Use a number for fixed amount: 2 3500")
+    lines.append("\nExample (send as one message):")
+    lines.append("1 8000\n2 5%")
+    lines.append("\nFixed amounts are deducted first, then percentages apply to the remainder.")
 
-    context.user_data["dist_rules"] = []
     await update.message.reply_text("\n".join(lines))
     return DIST_INPUT
 
 
 async def distribute_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    parts = text.split()
-    if len(parts) != 2:
-        await update.message.reply_text("Format: goal_id percentage (e.g. '1 50')")
-        return DIST_INPUT
-
-    try:
-        goal_id = int(parts[0])
-        pct = float(parts[1])
-    except ValueError:
-        await update.message.reply_text("Invalid input. Use: goal_id percentage")
-        return DIST_INPUT
-
-    if pct <= 0 or pct > 100:
-        await update.message.reply_text("Percentage must be between 0 and 100.")
-        return DIST_INPUT
-
-    context.user_data["dist_rules"].append((goal_id, pct))
-    await update.message.reply_text(f"Added: goal #{goal_id} = {pct}%. Send more or /done")
-    return DIST_INPUT
-
-
-async def distribute_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    rules = context.user_data.get("dist_rules", [])
-
-    if not rules:
-        await update.message.reply_text("No rules set. Cancelled.")
-        return ConversationHandler.END
-
-    total_pct = sum(pct for _, pct in rules)
-    if total_pct > 100:
-        await update.message.reply_text(
-            f"Total is {total_pct}% which exceeds 100%. Please start over with /distribute"
-        )
-        return ConversationHandler.END
-
-    db.set_distribution_rules(user_id, rules)
-
     goals = db.get_goals(user_id)
     goal_map = {g["id"]: g["name"] for g in goals}
 
+    rules = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) != 2:
+            await update.message.reply_text(f"Bad format: '{line}'\nUse: goal_id value (e.g. '1 8000' or '2 5%')")
+            return DIST_INPUT
+
+        try:
+            goal_id = int(parts[0])
+        except ValueError:
+            await update.message.reply_text(f"Invalid goal ID: '{parts[0]}'")
+            return DIST_INPUT
+
+        if goal_id not in goal_map:
+            await update.message.reply_text(f"Goal #{goal_id} not found. Use /goals to see IDs.")
+            return DIST_INPUT
+
+        value_str = parts[1]
+        if value_str.endswith("%"):
+            try:
+                pct = float(value_str[:-1])
+            except ValueError:
+                await update.message.reply_text(f"Invalid percentage: '{value_str}'")
+                return DIST_INPUT
+            if pct <= 0 or pct > 100:
+                await update.message.reply_text("Percentage must be between 0 and 100.")
+                return DIST_INPUT
+            rules.append((goal_id, "percentage", pct))
+        else:
+            try:
+                amount = float(value_str)
+            except ValueError:
+                await update.message.reply_text(f"Invalid amount: '{value_str}'. Use e.g. '1 8000' or '1 50%'")
+                return DIST_INPUT
+            if amount <= 0:
+                await update.message.reply_text("Amount must be positive.")
+                return DIST_INPUT
+            rules.append((goal_id, "fixed", amount))
+
+    if not rules:
+        await update.message.reply_text("No rules found. Try again or /cancel.")
+        return DIST_INPUT
+
+    total_pct = sum(v for _, rt, v in rules if rt == "percentage")
+    if total_pct > 100:
+        await update.message.reply_text(
+            f"Total percentages = {total_pct}% which exceeds 100%. Try again."
+        )
+        return DIST_INPUT
+
+    db.set_distribution_rules(user_id, rules)
+
     lines = ["Distribution rules saved:\n"]
-    for goal_id, pct in rules:
+    for goal_id, rule_type, value in rules:
         name = goal_map.get(goal_id, f"#{goal_id}")
-        lines.append(f"  {name}: {pct}%")
-    lines.append(f"  Free spending: {100 - total_pct}%")
-    lines.append("\nIncome will be auto-distributed when you use /income")
+        if rule_type == "fixed":
+            lines.append(f"  {name}: {value:,.2f} HKD fixed")
+        else:
+            lines.append(f"  {name}: {value}%")
+    lines.append(f"\n  Remaining: free spending")
+    lines.append("\nFixed amounts deducted first, then % applied to the rest.")
+    lines.append("Auto-distributed when you use /income")
 
     await update.message.reply_text("\n".join(lines))
     return ConversationHandler.END
+
+
+async def rules_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current distribution rules. Usage: /rules"""
+    user_id = update.effective_user.id
+    rules = db.get_distribution_rules(user_id)
+
+    if not rules:
+        await update.message.reply_text("No distribution rules set. Use /distribute to set them.")
+        return
+
+    lines = ["Current distribution rules:\n"]
+    total_fixed = 0
+    total_pct = 0
+    for r in rules:
+        if r["rule_type"] == "fixed":
+            lines.append(f"  {r['goal_name']}: {r['fixed_amount']:,.2f} HKD fixed")
+            total_fixed += r["fixed_amount"]
+        else:
+            lines.append(f"  {r['goal_name']}: {r['percentage']}%")
+            total_pct += r["percentage"]
+
+    lines.append("")
+    if total_fixed > 0:
+        lines.append(f"Total fixed: {total_fixed:,.2f} HKD (deducted first)")
+    if total_pct > 0:
+        lines.append(f"Total percentage: {total_pct}% (of remainder)")
+    if total_pct < 100:
+        lines.append(f"Free spending: {100 - total_pct}% of remainder")
+
+    lines.append("\nUse /distribute to change rules.")
+    await update.message.reply_text("\n".join(lines))
 
 
 def get_goal_handlers() -> list:
@@ -310,7 +368,6 @@ def get_goal_handlers() -> list:
         entry_points=[CommandHandler("distribute", distribute_start)],
         states={
             DIST_INPUT: [
-                CommandHandler("done", distribute_done),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, distribute_input),
             ],
         },
@@ -322,5 +379,6 @@ def get_goal_handlers() -> list:
         fund_conv,
         distribute_conv,
         CommandHandler("goals", goals_list),
+        CommandHandler("rules", rules_list),
         CommandHandler("deletegoal", deletegoal),
     ]

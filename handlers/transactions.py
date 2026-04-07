@@ -20,6 +20,18 @@ INCOME_CATEGORIES = [
 ]
 
 
+ALL_CATEGORIES = {c.lower(): c for c in EXPENSE_CATEGORIES + INCOME_CATEGORIES}
+
+
+def _normalize_category(raw: str) -> str:
+    """Normalize category to consistent casing. Matches known categories
+    case-insensitively, otherwise falls back to title case."""
+    if not raw:
+        return raw
+    key = raw.strip().lower()
+    return ALL_CATEGORIES.get(key, raw.strip().title())
+
+
 async def income_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start income logging. Usage: /income or /income 20000"""
     args = context.args
@@ -30,7 +42,7 @@ async def income_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Invalid amount. Usage: /income 20000")
             return ConversationHandler.END
 
-        category = " ".join(args[1:]) if len(args) > 1 else None
+        category = _normalize_category(" ".join(args[1:])) if len(args) > 1 else None
         return await _save_income(update, context, amount, category)
 
     context.user_data["tx_type"] = "income"
@@ -48,7 +60,7 @@ async def expense_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Invalid amount. Usage: /expense 150 Food")
             return ConversationHandler.END
 
-        category = " ".join(args[1:]) if len(args) > 1 else None
+        category = _normalize_category(" ".join(args[1:])) if len(args) > 1 else None
         return await _save_expense(update, context, amount, category)
 
     context.user_data["tx_type"] = "expense"
@@ -78,7 +90,7 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def category_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["category"] = update.message.text.strip()
+    context.user_data["category"] = _normalize_category(update.message.text.strip())
     tx_type = context.user_data["tx_type"]
     amount = context.user_data["amount"]
     category = context.user_data["category"]
@@ -119,7 +131,7 @@ async def _save_income(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if allocations:
         msg += "\n\nAuto-distributed to goals:"
         for a in allocations:
-            msg += f"\n  {a['goal_name']}: +{a['amount']:,.2f} ({a['percentage']}%)"
+            msg += f"\n  {a['goal_name']}: +{a['amount']:,.2f} ({a['label']})"
         total_alloc = sum(a["amount"] for a in allocations)
         free = amount - total_alloc
         msg += f"\n  Free spending: {free:,.2f}"
@@ -174,7 +186,19 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  {cat}: -{amt:,.2f}")
         lines.append(f"  Total: -{data['expense_total']:,.2f}\n")
 
+    # Goal contributions this month
+    contributions = db.get_monthly_contributions(user_id, year, month)
+    if contributions:
+        total_contrib = sum(c["total"] for c in contributions)
+        lines.append("GOAL CONTRIBUTIONS:")
+        for c in contributions:
+            lines.append(f"  {c['goal_name']}: {c['total']:,.2f}")
+        lines.append(f"  Total saved: {total_contrib:,.2f}\n")
+
     lines.append(f"NET: {data['net']:+,.2f} HKD")
+    if contributions:
+        free = data['net'] - sum(c["total"] for c in contributions)
+        lines.append(f"Free spending: {free:,.2f} HKD")
 
     await update.message.reply_text("\n".join(lines))
 
